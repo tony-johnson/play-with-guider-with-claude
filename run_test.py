@@ -6,9 +6,14 @@ Usage
 -----
     python run_test.py guider1.fits guider2.fits ... [options]
     python run_test.py /path/to/data/*.fits --single-frame --no-plot
+    python run_test.py --butler MC_O_20260513_000005 --sensors R00_SG0 R00_SG1
 
 Options
 -------
+  --butler EXPOSURE_ID      Read data via LSST butler
+  --sensors SENSOR [...]    Sensors to read from butler           [R00_SG0 R00_SG1]
+  --butler-repo NAME        Butler repository name                [embargo]
+  --butler-collections C    Butler collections to search
   --cutout-size INT         Cutout side length in pixels          [50]
   --min-snr FLOAT           Minimum S/N to accept a measurement   [10.0]
   --max-ellipticity FLOAT   Maximum |e| = sqrt(e1²+e2²)          [0.7]
@@ -34,7 +39,7 @@ import numpy as np
 import pandas as pd
 
 from centroid import Config, find_reference_position, process_guider
-from reader import read_guider_fits
+from reader import read_guider_fits, read_guider_butler
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +213,26 @@ def build_parser() -> argparse.ArgumentParser:
         description="Standalone guider centroid test framework.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("fits_files", nargs="+", metavar="FITS_FILE",
-                   help="One FITS file per guider.")
+    p.add_argument("fits_files", nargs="*", metavar="FITS_FILE",
+                   help="One FITS file per guider (not needed with --butler).")
+
+    butler_group = p.add_argument_group("butler options")
+    butler_group.add_argument(
+        "--butler", metavar="EXPOSURE_ID",
+        help="Read data via LSST butler using this exposure ID "
+             "(e.g. MC_O_20260513_000005).")
+    butler_group.add_argument(
+        "--sensors", nargs="+", metavar="SENSOR",
+        default=["R00_SG0", "R00_SG1", "R04_SG0", "R04_SG1", "R40_SG0", "R40_SG1", "R44_SG0", "R44_SG1"],
+        help="Sensor names to read from butler.")
+    butler_group.add_argument(
+        "--butler-repo", default="embargo",
+        help="Butler repository name.")
+    butler_group.add_argument(
+        "--butler-collections", nargs="+", metavar="COLL",
+        default=["LSSTCam/raw/all", "LSSTCam/raw/guider"],
+        help="Butler collections to search.")
+
     p.add_argument("--cutout-size", type=int, default=50)
     p.add_argument("--min-snr", type=float, default=10.0)
     p.add_argument("--max-ellipticity", type=float, default=0.7)
@@ -228,6 +251,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+
+    if not args.butler and not args.fits_files:
+        print("Error: provide FITS files or use --butler EXPOSURE_ID",
+              file=sys.stderr)
+        return 1
 
     logging.basicConfig(
         level=logging.WARNING if args.quiet else logging.INFO,
@@ -249,18 +277,32 @@ def main() -> int:
     all_catalogs = []
     wall_t0 = time.perf_counter()
 
-    for fits_path in args.fits_files:
-        fits_path = Path(fits_path)
-        if not fits_path.exists():
-            logging.error("File not found: %s", fits_path)
-            continue
-
-        # Read
+    # Load guider data from butler or from FITS files on disk
+    guiders = []
+    if args.butler:
         try:
-            guider = read_guider_fits(fits_path)
+            guiders = read_guider_butler(
+                exposure=args.butler,
+                sensors=args.sensors,
+                repo=args.butler_repo,
+                collections=args.butler_collections,
+            )
         except Exception as exc:
-            logging.error("Failed to read %s: %s", fits_path, exc)
-            continue
+            logging.error("Butler read failed: %s", exc)
+            return 1
+    else:
+        for fits_path in args.fits_files:
+            fits_path = Path(fits_path)
+            if not fits_path.exists():
+                logging.error("File not found: %s", fits_path)
+                continue
+            try:
+                guiders.append(read_guider_fits(fits_path))
+            except Exception as exc:
+                logging.error("Failed to read %s: %s", fits_path, exc)
+                continue
+
+    for guider in guiders:
 
         # Build reference image for plotting (before timing the algorithm)
         n_seed = 1 if args.single_frame else config.n_seed_frames

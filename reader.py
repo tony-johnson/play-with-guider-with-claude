@@ -145,3 +145,101 @@ def read_guider_fits(filepath: str | Path) -> GuiderStamps:
 def read_all_guiders(file_list: list[str | Path]) -> list[GuiderStamps]:
     """Read a list of guider FITS files and return one `GuiderStamps` per file."""
     return [read_guider_fits(f) for f in file_list]
+
+
+def read_guider_butler(
+    exposure: str,
+    sensors: list[str],
+    repo: str = "embargo",
+    collections: list[str] | None = None,
+) -> list[GuiderStamps]:
+    """Read guider FITS files via the LSST butler.
+
+    Parameters
+    ----------
+    exposure :
+        Exposure ID, e.g. ``'MC_O_20260513_000005'``.
+    sensors :
+        List of sensor names, e.g. ``['R00_SG0', 'R00_SG1']``.
+    repo :
+        Butler repository name.
+    collections :
+        Butler collections to search. Defaults to
+        ``['LSSTCam/raw/all', 'LSSTCam/raw/guider']``.
+
+    Returns
+    -------
+    list[GuiderStamps]
+    """
+    from lsst.daf.butler import Butler
+    from lsst.resources import ResourcePath
+
+    if collections is None:
+        collections = ["LSSTCam/raw/all", "LSSTCam/raw/guider"]
+
+    butler = Butler(repo, collections=collections)
+    results = []
+
+    for sensor in sensors:
+        records = list(butler.registry.queryDimensionRecords(
+            "detector",
+            instrument="LSSTCam",
+            where=f"detector.full_name='{sensor}'",
+        ))
+        if not records:
+            raise ValueError(f"No detector found for sensor '{sensor}'")
+        detector_id = records[0].id
+
+        uri = butler.getURI(
+            "guider_raw",
+            instrument="LSSTCam",
+            detector=detector_id,
+            exposure=exposure,
+        )
+        path = uri.geturl()
+        rb = ResourcePath(path)
+
+        with rb.open(mode="rb") as f:
+            with fits.open(f) as hdul:
+                primary_header = dict(hdul[0].header)
+                guider_name = primary_header.get("DETNAME", sensor)
+
+                primary_data = hdul[0].data
+                if primary_data is not None:
+                    if primary_data.ndim == 3:
+                        stamps = primary_data.astype(np.float32)
+                    elif primary_data.ndim == 2:
+                        stamps = primary_data[np.newaxis].astype(np.float32)
+                    else:
+                        stamps = None
+                else:
+                    stamps = None
+
+                if stamps is None:
+                    frames_2d = []
+                    for hdu in hdul[1:]:
+                        if hdu.data is None:
+                            continue
+                        if isinstance(hdu, (fits.ImageHDU, fits.CompImageHDU)):
+                            if hdu.data.ndim == 2:
+                                frames_2d.append(hdu.data.astype(np.float32))
+                            elif hdu.data.ndim == 3:
+                                stamps = hdu.data.astype(np.float32)
+                                break
+                    if stamps is None and frames_2d:
+                        stamps = np.stack(frames_2d, axis=0)
+
+                if stamps is None:
+                    raise ValueError(
+                        f"No image data found for sensor '{sensor}' "
+                        f"in exposure '{exposure}'"
+                    )
+
+                results.append(GuiderStamps(
+                    stamps=stamps,
+                    filename=path,
+                    guider_name=guider_name,
+                    header=primary_header,
+                ))
+
+    return results
