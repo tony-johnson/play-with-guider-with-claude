@@ -472,22 +472,36 @@ def find_reference_position(
         return None
 
     ny, nx = seed_image.shape
-    best_flux = -np.inf
+    best_peak = -np.inf
     best_xy: tuple[float, float] | None = None
 
     for label_id in range(1, n_components + 1):
         obj_mask = labeled == label_id
-        if obj_mask.sum() < config.n_pix_min:
+        n_pix = obj_mask.sum()
+        if n_pix < config.n_pix_min:
             continue
+
+        # Reject elongated artifacts (column/row stripes): require the
+        # component's bounding box to be reasonably compact.
+        ys, xs = np.where(obj_mask)
+        bbox_h = ys.max() - ys.min() + 1
+        bbox_w = xs.max() - xs.min() + 1
+        aspect = max(bbox_h, bbox_w) / max(min(bbox_h, bbox_w), 1)
+        if aspect > 5.0:
+            continue
+
         # Centroid of component
         cy, cx = ndi.center_of_mass(bkg_sub * obj_mask)
         # Edge margin check
         if (cx < config.edge_margin or cx > nx - config.edge_margin
                 or cy < config.edge_margin or cy > ny - config.edge_margin):
             continue
-        obj_flux = float(np.nansum(bkg_sub[obj_mask]))
-        if obj_flux > best_flux:
-            best_flux = obj_flux
+
+        # Use peak pixel value to select the star — a point source has a
+        # much higher peak than diffuse artifacts with more total flux.
+        peak = float(np.nanmax(bkg_sub[obj_mask]))
+        if peak > best_peak:
+            best_peak = peak
             best_xy = (float(cx), float(cy))
 
     if best_xy is None:
