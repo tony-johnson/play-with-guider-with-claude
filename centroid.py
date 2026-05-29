@@ -172,59 +172,85 @@ def annulus_background_subtraction(
 
 
 def _adaptive_moments_numpy(image: np.ndarray, max_iter: int = 50, tol: float = 1e-6) -> dict | None:
-    """Iterative weighted second-moment centroid (Hirata & Seljak 2003 style).
+    """2D Gaussian fit centroid using scipy.optimize.curve_fit.
 
-    Returns a dict with keys matching the GalSim HSM output used by
-    ``run_galsim``, or None on failure.
+    Fits on a small window around the peak for speed. Returns a dict with
+    keys matching the GalSim HSM output used by ``run_galsim``, or None on
+    failure.
     """
-    ny, nx = image.shape
-    yi, xi = np.indices((ny, nx), dtype=float)
+    from scipy.optimize import curve_fit
 
-    total = np.nansum(image)
-    if total <= 0:
+    ny, nx = image.shape
+    if np.nanmax(image) <= 0:
         return None
 
-    x0 = np.nansum(image * xi) / total
-    y0 = np.nansum(image * yi) / total
-    sigma = max(1.5, min(ny, nx) / 6.0)
+    # Find peak pixel as starting point
+    img_work = np.where(np.isfinite(image), image, 0.0)
+    peak_y, peak_x = np.unravel_index(np.argmax(img_work), (ny, nx))
 
-    for _ in range(max_iter):
-        dx = xi - x0
-        dy = yi - y0
-        W = np.exp(-0.5 * (dx**2 + dy**2) / sigma**2)
-        WI = W * image
-        norm = np.nansum(WI)
-        if norm <= 0:
-            return None
+    # Fit on a window around the peak (11x11 is enough for sigma~2-3)
+    hs = 5
+    y_lo = max(0, peak_y - hs)
+    y_hi = min(ny, peak_y + hs + 1)
+    x_lo = max(0, peak_x - hs)
+    x_hi = min(nx, peak_x + hs + 1)
+    sub = image[y_lo:y_hi, x_lo:x_hi]
 
-        x0_new = np.nansum(WI * xi) / norm
-        y0_new = np.nansum(WI * yi) / norm
+    sub_ny, sub_nx = sub.shape
+    if sub_ny < 5 or sub_nx < 5:
+        return None
 
-        dx = xi - x0_new
-        dy = yi - y0_new
-        Mxx = np.nansum(WI * dx**2) / norm
-        Myy = np.nansum(WI * dy**2) / norm
-        Mxy = np.nansum(WI * dx * dy) / norm
+    yy, xx = np.indices((sub_ny, sub_nx), dtype=float)
+    coords = (yy.ravel(), xx.ravel())
+    data = sub.ravel()
 
-        det = Mxx * Myy - Mxy**2
-        sigma_new = max(0.5, det**0.25) if det > 0 else sigma
+    valid = np.isfinite(data)
+    if valid.sum() < 7:
+        return None
+    coords_v = (coords[0][valid], coords[1][valid])
+    data_v = data[valid]
 
-        converged = (
-            abs(x0_new - x0) < tol
-            and abs(y0_new - y0) < tol
-            and abs(sigma_new - sigma) < tol
-        )
-        x0, y0, sigma = x0_new, y0_new, sigma_new
-        if converged:
-            break
+    # Initial guesses relative to sub-image
+    cx_init = float(peak_x - x_lo)
+    cy_init = float(peak_y - y_lo)
+    amp_init = float(np.nanmax(sub))
+    sigma_init = 2.0
 
+    def gauss2d(coords, amp, x0, y0, sigma_x, sigma_y, offset):
+        y, x = coords
+        return offset + amp * np.exp(-0.5 * ((x - x0) / sigma_x) ** 2
+                                     - 0.5 * ((y - y0) / sigma_y) ** 2)
+
+    p0 = [amp_init, cx_init, cy_init, sigma_init, sigma_init, 0.0]
+    bounds_lo = [0, cx_init - hs, cy_init - hs, 0.3, 0.3, -np.inf]
+    bounds_hi = [np.inf, cx_init + hs, cy_init + hs, hs * 2.0, hs * 2.0, np.inf]
+
+    try:
+        popt, _ = curve_fit(gauss2d, coords_v, data_v, p0=p0,
+                            bounds=(bounds_lo, bounds_hi), maxfev=500)
+    except (RuntimeError, ValueError):
+        return None
+
+    amp, x0_sub, y0_sub, sigma_x, sigma_y, offset = popt
+
+    # Convert back to full-image coordinates
+    x0 = x0_sub + x_lo
+    y0 = y0_sub + y_lo
+    if not (0 <= x0 < nx and 0 <= y0 < ny):
+        return None
+
+    sigma = np.sqrt(sigma_x * sigma_y)
+    Mxx = sigma_x ** 2
+    Myy = sigma_y ** 2
+    Mxy = 0.0
     denom = Mxx + Myy + 1e-30
     e1 = (Mxx - Myy) / denom
     e2 = 2.0 * Mxy / denom
     fwhm = 2.355 * sigma
+    flux = amp * 2 * np.pi * sigma_x * sigma_y
 
     return dict(x=x0, y=y0, sigma=sigma, fwhm=fwhm, e1=e1, e2=e2,
-                ixx=Mxx, iyy=Myy, ixy=Mxy, flux=norm)
+                ixx=Mxx, iyy=Myy, ixy=Mxy, flux=flux)
 
 
 # ---------------------------------------------------------------------------
@@ -302,8 +328,9 @@ def run_galsim(
         hsm = galsim.hsm.FindAdaptiveMom(gs_img, strict=False)
         if hsm.error_message != "":
             return StarMeasurement()
-        x0 = hsm.moments_centroid.x
-        y0 = hsm.moments_centroid.y
+        # GalSim uses 1-based pixel coordinates; convert to 0-based.
+        x0 = hsm.moments_centroid.x - 1
+        y0 = hsm.moments_centroid.y - 1
         sigma = hsm.moments_sigma
         e1 = hsm.observed_shape.e1
         e2 = hsm.observed_shape.e2
